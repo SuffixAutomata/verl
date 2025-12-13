@@ -17,7 +17,7 @@ import logging
 import os
 import random
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 from uuid import uuid4
 
 import hydra
@@ -225,7 +225,7 @@ class AgentLoopBase(ABC):
         cls._class_initialized = True
 
     @abstractmethod
-    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput | list[AgentLoopOutput]:
         """Run agent loop to interact with LLM server and environment.
 
         Args:
@@ -233,7 +233,8 @@ class AgentLoopBase(ABC):
             **kwargs: dataset fields from `verl.utils.dataset.RLHFDataset`.
 
         Returns:
-            AgentLoopOutput: Agent loop output.
+            AgentLoopOutput | list[AgentLoopOutput]: Agent loop output(s). Multiple outputs will be fanned out as
+            separate samples downstream.
         """
         raise NotImplementedError
 
@@ -392,7 +393,15 @@ class AgentLoopWorkerBase:
             )
         outputs = await asyncio.gather(*tasks)
 
-        output = self._postprocess(outputs)
+        # AgentLoop.run can optionally return multiple trajectories; flatten them here
+        flat_outputs: list[_InternalAgentLoopOutput] = []
+        for output in outputs:
+            if isinstance(output, list):
+                flat_outputs.extend(output)
+            else:
+                flat_outputs.append(output)
+
+        output = self._postprocess(flat_outputs)
 
         return output
 
@@ -404,7 +413,7 @@ class AgentLoopWorkerBase:
         agent_name: str,
         trace: bool = True,
         **kwargs,
-    ) -> _InternalAgentLoopOutput:
+    ) -> _InternalAgentLoopOutput | list[_InternalAgentLoopOutput]:
         with rollout_trace_attr(
             step=trajectory["step"],
             sample_index=trajectory["sample_index"],
@@ -425,12 +434,33 @@ class AgentLoopWorkerBase:
                 tokenizer=self.tokenizer,
                 processor=self.processor,
             )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-            return await self._agent_loop_postprocess(output, **kwargs)
+            outputs = await agent_loop.run(sampling_params, **kwargs)
+            processed_outputs = [
+                await self._agent_loop_postprocess(output, **kwargs)
+                for output in self._normalize_agent_outputs(outputs)
+            ]
+            return processed_outputs if len(processed_outputs) > 1 else processed_outputs[0]
+
+    @staticmethod
+    def _normalize_agent_outputs(
+        outputs: AgentLoopOutput | Sequence[AgentLoopOutput],
+    ) -> list[AgentLoopOutput]:
+        """Convert AgentLoop.run result to a list for uniform downstream handling."""
+        if isinstance(outputs, AgentLoopOutput):
+            return [outputs]
+        if isinstance(outputs, Sequence):
+            outputs_list = list(outputs)
+            if not outputs_list:
+                raise ValueError("Agent loop returned an empty output sequence.")
+            if not all(isinstance(output, AgentLoopOutput) for output in outputs_list):
+                raise TypeError("All items returned by AgentLoop.run must be AgentLoopOutput instances.")
+            return outputs_list
+        raise TypeError("AgentLoop.run must return AgentLoopOutput or a sequence of AgentLoopOutput.")
 
     async def _agent_loop_postprocess(self, output, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
-        output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+        raw_prompt_override = output.extra_fields.pop("raw_prompt_override", None)
+        output.extra_fields["raw_prompt"] = raw_prompt_override or kwargs["raw_prompt"]
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 

@@ -73,7 +73,8 @@ response token ids, and response mask.
 
 .. image:: https://github.com/eric-haibin-lin/verl-community/blob/main/docs/agent_loop_output.svg?raw=true
 
-.. note:: AgentLoopOutput only output one trajectory for a given prompt, multiple trajectories output is still under discussion.
+.. note:: ``AgentLoop.run`` can also return a list of ``AgentLoopOutput``. The default agent loop worker will fan out
+   each item as an independent sample. Custom or asynchronous workers may need the same handling added explicitly.
 
 Architecture Design
 -------------------
