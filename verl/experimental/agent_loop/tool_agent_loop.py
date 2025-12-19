@@ -135,7 +135,9 @@ class ToolAgentLoop(AgentLoopBase):
         if cls.clone_config["enabled"]:
             cls.clone_tool_schema = cls._build_clone_tool_schema(cls.clone_config)
             cls.tool_schemas.append(cls.clone_tool_schema.model_dump(exclude_unset=True, exclude_none=True))
-        cls.clone_reward_fn = cls._load_reward_fn(cls.clone_config)
+        # Store as a staticmethod to avoid Python binding it as an instance method
+        # (which would implicitly inject `self` and break the reward_fn signature).
+        cls.clone_reward_fn = staticmethod(cls._load_reward_fn(cls.clone_config))
         cls.tool_parser = ToolParser.get_tool_parser(config.actor_rollout_ref.rollout.multi_turn.format, cls.tokenizer)
         cls.tool_parser_name = config.actor_rollout_ref.rollout.multi_turn.format
         print(f"Initialized tools: {cls.tools}")
@@ -187,6 +189,9 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.extra_fields["parent_request_id"] = kwargs.get("parent_request_id")
         agent_data.extra_fields["clone_label"] = kwargs.get("clone_label")
         agent_data.extra_fields["clone_allow_tools"] = kwargs.get("clone_allow_tools", True)
+        agent_data.extra_fields["reward_model"] = kwargs.get("reward_model")
+        agent_data.extra_fields["data_source"] = kwargs.get("data_source")
+        agent_data.extra_fields["extra_info"] = kwargs.get("extra_info")
 
         # State machine loop
         state = AgentState.PENDING
@@ -219,6 +224,7 @@ class ToolAgentLoop(AgentLoopBase):
             metrics=agent_data.metrics,
             extra_fields={},
         )
+        output.extra_fields.update({k: v for k, v in agent_data.extra_fields.items() if v is not None})
         output.extra_fields.update(
             {
                 "turn_scores": agent_data.turn_scores,
@@ -616,7 +622,7 @@ class ToolAgentLoop(AgentLoopBase):
                 "system_prompt",
                 (
                     "You are a helper clone spawned by a root agent. "
-                    "Use a <think>...</think> block for reasoning, then provide a concise final answer. "
+                    "Denote a concise final answer with \"Answer:\". "
                     "Prefer short, actionable responses and conserve tokens."
                 ),
             ),
@@ -684,17 +690,27 @@ class ToolAgentLoop(AgentLoopBase):
         if not path:
             return _default_reward_fn
 
-        module_path, _, func_name = path.replace(":", ".").rpartition(".")
-        if not module_path or not func_name:
-            logger.warning("Invalid reward_function path '%s'; using default reward fn", path)
-            return _default_reward_fn
-
+        # Supported formats:
+        # 1) File path: "/abs/path/to/file.py:func_name" (recommended for local experiments)
+        # 2) Python import path: "some.pkg.module.func_name"
         try:
+            if ":" in path:
+                module_path, func_name = path.rsplit(":", 1)
+                from verl.utils.import_utils import load_extern_object
+
+                reward_fn = load_extern_object(module_path, func_name)
+                return reward_fn
+
+            module_path, _, func_name = path.rpartition(".")
+            if not module_path or not func_name:
+                logger.error("[BAD!!!] Invalid reward_function path '%s'; using default reward fn", path)
+                return _default_reward_fn
+
             module = __import__(module_path, fromlist=[func_name])
             reward_fn = getattr(module, func_name)
             return reward_fn
-        except (ImportError, AttributeError) as exc:
-            logger.warning("Failed to import reward_function '%s': %s; using default reward fn", path, exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[BAD!!!] Failed to import reward_function '%s': %s; using default reward fn", path, exc)
             return _default_reward_fn
 
     def _assign_rewards(self, root_output: AgentLoopOutput, clone_rollouts: list[AgentLoopOutput]) -> float:
@@ -838,6 +854,9 @@ class ToolAgentLoop(AgentLoopBase):
             output.extra_fields.setdefault("reward_extra_info", {})
             output.extra_fields.setdefault("turn_scores", [])
             output.extra_fields.setdefault("tool_rewards", [])
+            output.extra_fields.setdefault("reward_model", agent_data.extra_fields.get("reward_model"))
+            output.extra_fields.setdefault("data_source", agent_data.extra_fields.get("data_source"))
+            output.extra_fields.setdefault("extra_info", agent_data.extra_fields.get("extra_info"))
             output.extra_fields["raw_prompt_override"] = clone_prompt
 
         main_output = clone_outputs_list[0]

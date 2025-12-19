@@ -54,6 +54,7 @@ class LocalHFServerManager:
 
         def _generate_sync():
             with torch.no_grad():
+                print(input_ids, attention_mask, max_new_tokens, temperature, top_p)
                 return self.model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -66,6 +67,7 @@ class LocalHFServerManager:
 
         output_ids = await loop.run_in_executor(None, _generate_sync)
         new_tokens = output_ids[0, input_ids.shape[1] :].tolist()
+        print(f"Generated {len(new_tokens)} tokens")
         return TokenOutput(token_ids=new_tokens)
 
 
@@ -188,7 +190,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tasks",
         nargs="+",
-        default=["summarize the repo goals", "list two interesting files"],
+        default=["list three facts about the riemann hypothesis", "list three facts about shakespeare's hamlet"],
         help="Objectives to pass to spawn_clone.",
     )
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")

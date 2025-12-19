@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from omegaconf import MISSING
 
@@ -57,6 +57,9 @@ class MultiTurnConfig(BaseConfig):
     tokenization_sanity_check_mode: str = "strict"
     format: str = "hermes"
     num_repeat_rollouts: Optional[int] = None
+    # Optional nested config for experimental agent-loop extensions (e.g. clone tool).
+    # Kept as a plain dict to avoid hard-coding schemas into core rollout configs.
+    clone: Optional[dict[str, Any]] = None
 
 
 @dataclass

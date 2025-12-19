@@ -1,0 +1,140 @@
+# Example PPO config wired for ToolAgentLoop clone rollouts.
+# Point --config-path to this directory and --config-name to this file when
+# running `python -m verl.trainer.main_ppo`.
+
+hydra:
+  searchpath:
+    - file:///mnt/gemininjceph2/geminicephfs/pr-others-prctrans/darren/verl/verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  tokenizer: null
+  train_files: /mnt/gemininjceph2/geminicephfs/pr-others-prctrans/darren/openai-gsm8k/preprocessed/train.parquet
+  val_files: /mnt/gemininjceph2/geminicephfs/pr-others-prctrans/darren/openai-gsm8k/preprocessed/test.parquet
+  train_batch_size: 32
+  val_batch_size: null
+  max_prompt_length: 2048
+  max_response_length: 1024
+  prompt_key: prompt
+  reward_fn_key: data_source
+  return_raw_chat: True
+  return_raw_input_ids: False
+  filter_overlong_prompts: True
+  truncation: error
+  apply_chat_template_kwargs: {}
+  # Tool schemas are loaded by ToolAgentLoop itself; keep this null unless you
+  # also want external tools beyond spawn_clone.
+  tool_config_path: null
+
+actor_rollout_ref:
+  hybrid_engine: True
+
+  model:
+    path: /path/to/model
+    custom_chat_template: null
+    override_config: {}
+    enable_gradient_checkpointing: True
+    use_remove_padding: False
+
+  actor:
+    strategy: fsdp
+    ppo_mini_batch_size: 16
+    ppo_micro_batch_size_per_gpu: 1
+    grad_clip: 1.0
+    clip_ratio: 0.2
+    entropy_coeff: 0.0
+    use_dynamic_bsz: False
+    optim:
+      lr: 1e-6
+      lr_warmup_steps: -1
+      lr_scheduler_type: constant
+      total_training_steps: -1  # filled at runtime
+    fsdp_config:
+      param_offload: False
+      optimizer_offload: False
+      wrap_policy:
+        min_num_params: 0
+
+  # Reference is unused when algorithm.use_kl_in_reward is False, but kept for clarity.
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+    fsdp_config:
+      param_offload: True
+      wrap_policy:
+        min_num_params: 0
+
+  rollout:
+    name: vllm
+    prompt_length: ${data.max_prompt_length}
+    response_length: ${data.max_response_length}
+    temperature: 0.7
+    top_p: 0.9
+    n: 1
+    do_sample: True
+    tensor_model_parallel_size: 1
+    data_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    gpu_memory_utilization: 0.6
+    log_prob_micro_batch_size_per_gpu: 1
+    free_cache_engine: True
+
+    # Multi-turn + clone tool settings consumed by ToolAgentLoop
+    multi_turn:
+      enable: True
+      format: hermes
+      max_user_turns: 4
+      max_assistant_turns: 4
+      max_parallel_calls: 4
+      max_tool_response_length: 512
+      tool_response_truncate_side: right
+      tool_config_path: null
+      interaction_config_path: null
+      clone:
+        enable: True
+        allow_tool_use: True
+        allow_nested_clones: False
+        max_clones_per_call: 3
+        max_clone_depth: 1
+        reward_function: /mnt/gemininjceph2/geminicephfs/pr-others-prctrans/darren/verl/examples/agent_loop/clone_reward.py:clone_accuracy_reward
+        final_answer_markers:
+          - "Final answer:"
+          - "Answer:"
+
+    agent:
+      num_workers: 1
+      default_agent_loop: tool_agent
+      agent_loop_config_path: null
+
+reward_model:
+  enable: False
+  enable_resource_pool: False
+  use_reward_loop: False
+
+# PPO with `adv_estimator: gae` requires a critic (value function). The upstream
+# `ppo_trainer` defaults point the critic at a placeholder local path; override
+# it to reuse the policy initialization unless you explicitly want a separate
+# critic model.
+critic:
+  model:
+    path: ${actor_rollout_ref.model.path}
+    tokenizer_path: ${actor_rollout_ref.model.path}
+  ppo_micro_batch_size_per_gpu: 1
+
+trainer:
+  project_name: clone_tool_agent
+  experiment_name: debug_run
+  n_gpus_per_node: 8
+  nnodes: 2
+  total_epochs: 1
+  save_freq: 1000
+  test_freq: 1000
+  logger: tensorboard
+
+algorithm:
+  adv_estimator: gae
+  use_kl_in_reward: False
+  gamma: 1.0
+  lam: 1.0
