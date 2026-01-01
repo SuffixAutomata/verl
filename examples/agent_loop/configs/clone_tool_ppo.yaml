@@ -12,12 +12,12 @@ defaults:
 
 data:
   tokenizer: null
-  train_files: /mnt/gemininjceph2/geminicephfs/pr-others-prctrans/darren/openai-gsm8k/preprocessed/train.parquet
-  val_files: /mnt/gemininjceph2/geminicephfs/pr-others-prctrans/darren/openai-gsm8k/preprocessed/test.parquet
+  train_files: /mnt/gemininjceph2/geminicephfs/pr-others-prctrans/darren/arith/train.parquet
+  val_files: /mnt/gemininjceph2/geminicephfs/pr-others-prctrans/darren/arith/test.parquet
   train_batch_size: 32
   val_batch_size: null
   max_prompt_length: 2048
-  max_response_length: 1024
+  max_response_length: 4096
   prompt_key: prompt
   reward_fn_key: data_source
   return_raw_chat: True
@@ -41,7 +41,7 @@ actor_rollout_ref:
 
   actor:
     strategy: fsdp
-    ppo_mini_batch_size: 16
+    ppo_mini_batch_size: 8
     ppo_micro_batch_size_per_gpu: 1
     grad_clip: 1.0
     clip_ratio: 0.2
@@ -85,9 +85,9 @@ actor_rollout_ref:
     multi_turn:
       enable: True
       format: hermes
-      max_user_turns: 4
-      max_assistant_turns: 4
-      max_parallel_calls: 4
+      max_user_turns: 10
+      max_assistant_turns: 10
+      max_parallel_calls: 10
       max_tool_response_length: 512
       tool_response_truncate_side: right
       tool_config_path: null
@@ -100,8 +100,13 @@ actor_rollout_ref:
         max_clone_depth: 1
         reward_function: /mnt/gemininjceph2/geminicephfs/pr-others-prctrans/darren/verl/examples/agent_loop/clone_reward.py:clone_accuracy_reward
         final_answer_markers:
-          - "Final answer:"
+          - "</think>"
+          - "Final Answer:"
+          - "final answer:"
           - "Answer:"
+          - "Result:"
+          - "OUTPUT:"
+          - "#### "
 
     agent:
       num_workers: 1
@@ -125,12 +130,12 @@ critic:
 
 trainer:
   project_name: clone_tool_agent
-  experiment_name: debug_run
+  experiment_name: clone_debug
   n_gpus_per_node: 8
-  nnodes: 2
+  nnodes: 1
   total_epochs: 1
-  save_freq: 1000
-  test_freq: 1000
+  save_freq: 50
+  test_freq: 50
   logger: tensorboard
 
 algorithm:

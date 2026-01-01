@@ -461,6 +461,11 @@ class AgentLoopWorkerBase:
         """Perform post-processing operations on the output of each individual agent loop."""
         raw_prompt_override = output.extra_fields.pop("raw_prompt_override", None)
         output.extra_fields["raw_prompt"] = raw_prompt_override or kwargs["raw_prompt"]
+        # Preserve the originating sample index so training can align fan-out rollouts (e.g., clones)
+        if "fanout_index" in kwargs:
+            output.extra_fields["__fanout_index__"] = kwargs["fanout_index"]
+        elif "index" in kwargs:
+            output.extra_fields["__fanout_index__"] = kwargs["index"]
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 

@@ -77,6 +77,87 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
     )
 
 
+def _compute_agentic_clone_metrics(batch: DataProto) -> dict[str, Any]:
+    roles = batch.non_tensor_batch.get("actor_role")
+    request_ids = batch.non_tensor_batch.get("request_id")
+    parent_request_ids = batch.non_tensor_batch.get("parent_request_id")
+    if roles is None or request_ids is None or parent_request_ids is None:
+        return {}
+
+    roles = np.asarray(roles, dtype=object)
+    request_ids = np.asarray(request_ids, dtype=object)
+    parent_request_ids = np.asarray(parent_request_ids, dtype=object)
+    if roles.size == 0:
+        return {}
+
+    if "response_mask" not in batch.batch.keys():
+        return {}
+    response_mask = batch.batch["response_mask"]
+
+    generated_tokens = response_mask.sum(dim=-1).detach().cpu().numpy().astype(np.float32)
+    response_info = _compute_response_info(batch)
+    prompt_length = response_info["prompt_length"].detach().cpu().numpy().astype(np.float32)
+    response_length = response_info["response_length"].detach().cpu().numpy().astype(np.float32)
+
+    root_mask = roles == "root"
+    if not root_mask.any():
+        return {}
+
+    root_indices = np.nonzero(root_mask)[0]
+    root_generated_tokens = []
+    root_prompt_tokens = []
+    root_response_tokens = []
+    clone_counts = []
+    clone_generated_tokens = []
+    total_generated_tokens = []
+    for idx in root_indices:
+        root_id = request_ids[idx]
+        if root_id is None:
+            continue
+
+        clone_mask = parent_request_ids == root_id
+        clone_count = int(clone_mask.sum())
+        clone_generated = float(generated_tokens[clone_mask].sum()) if clone_count else 0.0
+
+        root_generated = float(generated_tokens[idx])
+        root_prompt = float(prompt_length[idx])
+        root_response = float(response_length[idx])
+        total_generated = root_generated + clone_generated
+
+        root_generated_tokens.append(root_generated)
+        root_prompt_tokens.append(root_prompt)
+        root_response_tokens.append(root_response)
+        clone_counts.append(clone_count)
+        clone_generated_tokens.append(clone_generated)
+        total_generated_tokens.append(total_generated)
+
+    if not root_generated_tokens:
+        return {}
+
+    metrics: dict[str, Any] = {}
+
+    def _add_stats(name: str, values: list[float]) -> None:
+        arr = np.asarray(values, dtype=np.float32)
+        metrics[f"agentic/{name}/mean"] = float(arr.mean())
+        metrics[f"agentic/{name}/max"] = float(arr.max())
+        metrics[f"agentic/{name}/min"] = float(arr.min())
+
+    _add_stats("root_generated_tokens", root_generated_tokens)
+    _add_stats("root_prompt_tokens", root_prompt_tokens)
+    _add_stats("root_response_tokens", root_response_tokens)
+    _add_stats("clone_count", clone_counts)
+    _add_stats("clone_generated_tokens", clone_generated_tokens)
+    _add_stats("total_generated_tokens", total_generated_tokens)
+
+    total_clone_tokens = float(np.sum(clone_generated_tokens))
+    total_clone_count = float(np.sum(clone_counts))
+    metrics["agentic/clone_tokens_per_clone"] = (
+        total_clone_tokens / total_clone_count if total_clone_count > 0 else 0.0
+    )
+
+    return metrics
+
+
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
@@ -220,6 +301,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/min"] = tool_call_counts.min()
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
+
+    metrics.update(_compute_agentic_clone_metrics(batch))
 
     return metrics
 

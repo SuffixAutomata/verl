@@ -1,153 +1,202 @@
 """
-Smoke test for the clone-aware ToolAgentLoop.
+Smoke test for the clone-aware ToolAgentLoop using a vLLM rollout server.
 
-This runs a single rollout with a pretrained HF model (no training) where the
-root calls the built-in `spawn_clone` tool with multiple objectives and we
-verify that multiple rollouts (root + clones) are returned in the batch.
-
-Notes:
-- This script does not start any Ray servers; it uses a local HF model through
-  a minimal server manager shim.
-- The model you choose must be able to emit tool calls in the parser format you
-  configure (default: Hermes-style <tool_call>...</tool_call>).
-- No tests are executed here; run this script in an environment with the model
-  available.
+This script composes a full Hydra config (so rollout configs carry _target_),
+reads a test parquet dataset, and runs each prompt through ToolAgentLoop.
+Rewards come from the clone reward function configured in the rollout config.
 """
+
+from __future__ import annotations
 
 import argparse
 import asyncio
 import os
-from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable
 
+import datasets
+import ray
 import torch
+from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 
-from verl.experimental.agent_loop.agent_loop import _DummyConfig
+from verl.experimental.agent_loop.agent_loop import AsyncLLMServerManager, _DummyConfig
 from verl.experimental.agent_loop.tool_agent_loop import ToolAgentLoop
-from verl.workers.rollout.replica import TokenOutput
+from verl.workers.rollout.replica import get_rollout_replica_class
+
+DEFAULT_REWARD_FN = "examples/agent_loop/clone_reward.py:clone_accuracy_reward"
 
 
-class LocalHFServerManager:
-    """Thin async wrapper that matches AsyncLLMServerManager.generate signature."""
-
-    def __init__(self, model, device: torch.device):
-        self.model = model
-        self.device = device
-
-    async def generate(
-        self,
-        request_id: str,
-        *,
-        prompt_ids: list[int],
-        sampling_params: dict[str, Any],
-        image_data=None,
-    ) -> TokenOutput:
-        loop = asyncio.get_running_loop()
-        max_new_tokens = int(sampling_params.get("max_new_tokens", 512))
-        temperature = float(sampling_params.get("temperature", 0.7))
-        top_p = float(sampling_params.get("top_p", 0.9))
-
-        input_ids = torch.tensor(prompt_ids, device=self.device).unsqueeze(0)
-        attention_mask = torch.ones_like(input_ids)
-
-        def _generate_sync():
-            with torch.no_grad():
-                print(input_ids, attention_mask, max_new_tokens, temperature, top_p)
-                return self.model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    do_sample=True,
-                    temperature=temperature,
-                    top_p=top_p,
-                    max_new_tokens=max_new_tokens,
-                    pad_token_id=self.model.config.eos_token_id,
-                )
-
-        output_ids = await loop.run_in_executor(None, _generate_sync)
-        new_tokens = output_ids[0, input_ids.shape[1] :].tolist()
-        print(f"Generated {len(new_tokens)} tokens")
-        return TokenOutput(token_ids=new_tokens)
+def _maybe_select(config: OmegaConf, path: str, default: Any) -> Any:
+    value = OmegaConf.select(config, path)
+    return default if value is None else value
 
 
-def build_minimal_config(model_path: str) -> Any:
-    """Return a minimal OmegaConf matching ToolAgentLoop expectations."""
-    cfg = {
-        "trainer": {"project_name": "clone_smoke", "experiment_name": "local"},
-        "data": {"apply_chat_template_kwargs": {}},
-        "actor_rollout_ref": {
-            "model": {"path": model_path, "custom_chat_template": None},
-            "rollout": {
-                "prompt_length": 2048,
-                "response_length": 1024,
-                "temperature": 0.7,
-                "top_p": 0.9,
-                "calculate_log_probs": False,
-                "multi_turn": {
-                    "enable": True,
-                    "format": "hermes",  # or "gpt-oss" to match your model
-                    "max_user_turns": 4,
-                    "max_assistant_turns": 4,
-                    "max_parallel_calls": 4,
-                    "max_tool_response_length": 512,
-                    "tool_response_truncate_side": "right",
-                    "tool_config_path": None,  # add if you want extra tools
-                    "interaction_config_path": None,
-                    "clone": {
-                        "enable": True,
-                        "max_clones_per_call": 4,
-                        "max_clone_depth": 1,
-                        "allow_tool_use": True,
-                        "allow_nested_clones": False,
-                        "reward_function": None,  # e.g. "my_pkg.rewards:clone_reward_fn"
-                    },
-                },
-                "agent": {"num_workers": 1, "default_agent_loop": "tool_agent"},
-                "trace": {},
-            },
-        },
-        "reward_model": {
-            "enable": False,
-            "enable_resource_pool": False,
-            "use_reward_loop": False,
-        },
-        "trainer_config": {},
-    }
-    return OmegaConf.create(cfg)
+def load_config(config_path: str, config_name: str, overrides: list[str]) -> OmegaConf:
+    if not os.path.isdir(config_path):
+        raise FileNotFoundError(f"Config directory not found: {config_path}")
+    if config_name.endswith(".yaml"):
+        config_name = config_name[: -len(".yaml")]
+    with initialize_config_dir(config_dir=config_path):
+        return compose(config_name=config_name, overrides=overrides)
 
 
-def build_prompt(tasks: list[str]) -> list[dict[str, str]]:
-    """Construct a prompt that strongly nudges the model to call spawn_clone."""
-    task_list = "\\n- ".join(tasks)
-    instructions = (
-        "You are the root agent. Call the tool `spawn_clone` with all objectives below and nothing else. "
-        "Use Hermes-style tool calls: <tool_call>{\"name\": \"spawn_clone\", "
-        "\"arguments\": {\"objectives\": [\"task1\", \"task2\"]}}</tool_call>. "
-        "After the tool responses are processed you will see the summaries from clones."
-    )
-    return [
-        {"role": "system", "content": instructions},
-        {"role": "user", "content": f"Objectives to delegate:\n- {task_list}"},
-    ]
+def _expand_path(path: str) -> str:
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def resolve_dataset_paths(dataset_paths: Iterable[str]) -> list[str]:
+    resolved: list[str] = []
+    for path in dataset_paths:
+        expanded = _expand_path(path)
+        if os.path.isdir(expanded):
+            test_path = os.path.join(expanded, "test.parquet")
+            if not os.path.exists(test_path):
+                raise FileNotFoundError(f"Expected test parquet at {test_path}")
+            resolved.append(test_path)
+        else:
+            if not os.path.exists(expanded):
+                raise FileNotFoundError(f"Dataset file not found: {expanded}")
+            resolved.append(expanded)
+    return resolved
+
+
+def load_dataset(paths: list[str]) -> datasets.Dataset:
+    return datasets.load_dataset("parquet", data_files=paths)["train"]
+
+
+def sample_dataset(dataset: datasets.Dataset, max_samples: int, seed: int | None) -> datasets.Dataset:
+    if max_samples <= 0 or max_samples >= len(dataset):
+        return dataset
+    if seed is None:
+        return dataset.select(range(max_samples))
+    indices = torch.randperm(len(dataset), generator=torch.Generator().manual_seed(seed))[:max_samples].tolist()
+    return dataset.select(indices)
+
+
+async def run_samples(
+    agent_loop: ToolAgentLoop,
+    tokenizer,
+    dataset: datasets.Dataset,
+    sampling_params: dict[str, Any],
+    *,
+    print_responses: bool,
+) -> None:
+    total_reward = 0.0
+    scored = 0
+    exact = 0
+
+    for idx, row in enumerate(dataset):
+        raw_prompt = row["prompt"]
+        reward_model = row.get("reward_model")
+        data_source = row.get("data_source")
+        extra_info = dict(row.get("extra_info") or {})
+        extra_info.setdefault("interaction_kwargs", {})
+        tools_kwargs = extra_info.get("tools_kwargs", {})
+        sample_index = extra_info.get("index", idx)
+
+        outputs = await agent_loop.run(
+            sampling_params,
+            raw_prompt=raw_prompt,
+            multi_modal_data={},
+            tools_kwargs=tools_kwargs,
+            reward_model=reward_model,
+            data_source=data_source,
+            index=sample_index,
+            extra_info=extra_info,
+        )
+
+        outputs_list = outputs if isinstance(outputs, list) else [outputs]
+        root = outputs_list[0]
+        reward = root.reward_score if root.reward_score is not None else 0.0
+        total_reward += reward
+        scored += 1
+        if reward >= 1.0:
+            exact += 1
+
+        if print_responses:
+            print(f"[{idx}] reward={reward}")
+            for out in outputs_list:
+                role = out.extra_fields.get("actor_role", "unknown")
+                label = out.extra_fields.get("clone_label")
+                text = tokenizer.decode(out.response_ids, skip_special_tokens=True)
+                print(f"- role={role} label={label}")
+                print(text)
+                print("-" * 20)
+
+    if scored == 0:
+        print("No samples processed.")
+        return
+
+    mean_reward = total_reward / scored
+    print(f"Processed {scored} samples | mean_reward={mean_reward:.4f} | exact={exact}/{scored}")
 
 
 async def main(args):
-    device = torch.device(args.device)
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        trust_remote_code=True,
-        torch_dtype=torch.float16 if "cuda" in device.type else torch.float32,
-        device_map="auto" if "cuda" in device.type else None,
+    overrides = list(args.override or [])
+    if args.model:
+        overrides.append(f"actor_rollout_ref.model.path={args.model}")
+    if args.dataset:
+        overrides.append(f"data.val_files={args.dataset}")
+    if args.reward_function:
+        overrides.append(f"actor_rollout_ref.rollout.multi_turn.clone.reward_function={args.reward_function}")
+    if args.tool_format:
+        overrides.append(f"actor_rollout_ref.rollout.multi_turn.format={args.tool_format}")
+    if args.prompt_length is not None:
+        overrides.append(f"actor_rollout_ref.rollout.prompt_length={args.prompt_length}")
+    if args.response_length is not None:
+        overrides.append(f"actor_rollout_ref.rollout.response_length={args.response_length}")
+    if args.gpu_memory_utilization is not None:
+        overrides.append(f"actor_rollout_ref.rollout.gpu_memory_utilization={args.gpu_memory_utilization}")
+    if args.max_clones is not None:
+        overrides.append(f"actor_rollout_ref.rollout.multi_turn.clone.max_clones_per_call={args.max_clones}")
+    if args.max_clone_depth is not None:
+        overrides.append(f"actor_rollout_ref.rollout.multi_turn.clone.max_clone_depth={args.max_clone_depth}")
+
+    if torch.cuda.device_count() == 0:
+        raise RuntimeError("vLLM rollout requires CUDA GPUs; none detected.")
+    tensor_parallel_size = args.tensor_parallel_size or torch.cuda.device_count()
+    overrides.append(f"actor_rollout_ref.rollout.tensor_model_parallel_size={tensor_parallel_size}")
+
+    config = load_config(args.config_path, args.config_name, overrides)
+
+    reward_function = _maybe_select(
+        config, "actor_rollout_ref.rollout.multi_turn.clone.reward_function", DEFAULT_REWARD_FN
     )
+    if not reward_function:
+        config.actor_rollout_ref.rollout.multi_turn.clone.reward_function = DEFAULT_REWARD_FN
+
+    val_files = _maybe_select(config, "data.val_files", None)
+    if val_files is None:
+        raise ValueError("Validation dataset path is missing; set data.val_files or pass --dataset.")
+    if isinstance(val_files, (list, tuple)):
+        dataset_paths = [str(p) for p in val_files]
+    else:
+        dataset_paths = [str(val_files)]
+    dataset_paths = resolve_dataset_paths(dataset_paths)
+    dataset = load_dataset(dataset_paths)
+    dataset = sample_dataset(dataset, args.max_samples, args.seed)
+
+    ray.init(ignore_reinit_error=True)
+    rollout_server_class = get_rollout_replica_class(config.actor_rollout_ref.rollout.name)
+    rollout_server = rollout_server_class(
+        replica_rank=0,
+        config=config.actor_rollout_ref.rollout,
+        model_config=config.actor_rollout_ref.model,
+        gpus_per_node=config.actor_rollout_ref.rollout.tensor_model_parallel_size,
+    )
+    await rollout_server.init_standalone()
+
+    server_manager = AsyncLLMServerManager(config=config, server_handles=[rollout_server.server_handle])
+
+    model_path = _maybe_select(config, "actor_rollout_ref.model.path", None)
+    if model_path is None:
+        raise ValueError("Model path is missing; set actor_rollout_ref.model.path or pass --model.")
+    trust_remote_code = bool(_maybe_select(config, "data.trust_remote_code", False))
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust_remote_code)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    config = build_minimal_config(args.model)
-    server_manager = LocalHFServerManager(model, device)
-
-    # Prepare agent loop
     agent_loop = ToolAgentLoop(
         trainer_config=_DummyConfig(config=config),
         server_manager=server_manager,
@@ -156,47 +205,60 @@ async def main(args):
     )
 
     sampling_params = {
-        "temperature": args.temperature,
-        "top_p": args.top_p,
-        "max_new_tokens": args.max_new_tokens,
+        "temperature": args.temperature or config.actor_rollout_ref.rollout.temperature,
+        "top_p": args.top_p or config.actor_rollout_ref.rollout.top_p,
+        "max_new_tokens": args.max_new_tokens or config.actor_rollout_ref.rollout.response_length,
         "logprobs": False,
     }
 
-    prompt = build_prompt(args.tasks)
-    outputs = await agent_loop.run(
-        sampling_params,
-        raw_prompt=prompt,
-        multi_modal_data={},
-        tools_kwargs={},
-        extra_info={"interaction_kwargs": {}},
-    )
-
-    outputs_list = outputs if isinstance(outputs, list) else [outputs]
-    print(f"Returned {len(outputs_list)} rollouts")
-    for idx, out in enumerate(outputs_list):
-        role = out.extra_fields.get("actor_role", "unknown")
-        clone_id = out.extra_fields.get("clone_id")
-        label = out.extra_fields.get("clone_label")
-        reward = out.reward_score
-        text = tokenizer.decode(out.response_ids, skip_special_tokens=True)
-        print(f"[{idx}] role={role} clone_id={clone_id} label={label} reward={reward}")
-        print(text)
-        print("-" * 40)
+    try:
+        await run_samples(
+            agent_loop,
+            tokenizer,
+            dataset,
+            sampling_params,
+            print_responses=args.print_responses,
+        )
+    finally:
+        ray.shutdown()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, required=True, help="HF model name or path.")
+    parser.add_argument("--config-path", type=str, default="examples/agent_loop/configs")
+    parser.add_argument("--config-name", type=str, default="clone_tool_ppo")
     parser.add_argument(
-        "--tasks",
-        nargs="+",
-        default=["list three facts about the riemann hypothesis", "list three facts about shakespeare's hamlet"],
-        help="Objectives to pass to spawn_clone.",
+        "--override",
+        action="append",
+        default=None,
+        help="Additional Hydra override strings (repeatable).",
     )
-    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--temperature", type=float, default=0.1)
-    parser.add_argument("--top_p", type=float, default=0.9)
-    parser.add_argument("--max_new_tokens", type=int, default=256)
+    parser.add_argument("--model", type=str, default=None, help="Override actor_rollout_ref.model.path.")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Override data.val_files (path or directory with test.parquet).",
+    )
+    parser.add_argument(
+        "--reward-function",
+        type=str,
+        default=None,
+        help=f"Override reward function path. Default: {DEFAULT_REWARD_FN}",
+    )
+    parser.add_argument("--tool-format", type=str, default=None)
+    parser.add_argument("--prompt-length", type=int, default=None)
+    parser.add_argument("--response-length", type=int, default=None)
+    parser.add_argument("--temperature", type=float, default=None)
+    parser.add_argument("--top-p", type=float, default=None)
+    parser.add_argument("--max-new-tokens", type=int, default=None)
+    parser.add_argument("--max-samples", type=int, default=-1)
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--tensor-parallel-size", type=int, default=None)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=None)
+    parser.add_argument("--max-clones", type=int, default=None)
+    parser.add_argument("--max-clone-depth", type=int, default=None)
+    parser.add_argument("--print-responses", action="store_true")
     args = parser.parse_args()
 
     asyncio.run(main(args))

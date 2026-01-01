@@ -192,6 +192,7 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.extra_fields["reward_model"] = kwargs.get("reward_model")
         agent_data.extra_fields["data_source"] = kwargs.get("data_source")
         agent_data.extra_fields["extra_info"] = kwargs.get("extra_info")
+        agent_data.extra_fields["sample_index"] = kwargs.get("index")
 
         # State machine loop
         state = AgentState.PENDING
@@ -856,7 +857,10 @@ class ToolAgentLoop(AgentLoopBase):
             output.extra_fields.setdefault("tool_rewards", [])
             output.extra_fields.setdefault("reward_model", agent_data.extra_fields.get("reward_model"))
             output.extra_fields.setdefault("data_source", agent_data.extra_fields.get("data_source"))
-            output.extra_fields.setdefault("extra_info", agent_data.extra_fields.get("extra_info"))
+            if agent_data.extra_fields.get("extra_info") is not None:
+                output.extra_fields["extra_info"] = agent_data.extra_fields.get("extra_info")
+            else:
+                output.extra_fields.pop("extra_info", None)
             output.extra_fields["raw_prompt_override"] = clone_prompt
 
         main_output = clone_outputs_list[0]

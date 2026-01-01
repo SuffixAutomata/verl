@@ -69,14 +69,7 @@ def clone_accuracy_reward(
         return {"reward": 0.0, "reason": "missing_ground_truth"}
 
     try:
-        score = float(
-            default_compute_score(
-                data_source,
-                _normalize_root_answer_for_scoring(data_source, root_answer),
-                ground_truth,
-                extra_info=root_extra,
-            )
-        )
+        score = 1.0 if int(root_answer.strip()) == int(ground_truth.strip()) else 0.1
     except Exception:
         # Fallback: exact/substring match
         score = 1.0 if str(ground_truth).strip() in root_answer else 0.0
