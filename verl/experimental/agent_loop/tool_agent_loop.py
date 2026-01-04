@@ -253,9 +253,6 @@ class ToolAgentLoop(AgentLoopBase):
         for rollout in outputs:
             rollout.reward_score = reward_value
             rollout.extra_fields.setdefault("reward_source", "clone_reward_fn")
-        
-        # TODO: COLLAPSE LIST OUTPUT
-
         return outputs if len(outputs) > 1 else outputs[0]
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
