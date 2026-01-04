@@ -3,8 +3,3 @@ excludes: ["/.git/"]
 env_vars:
   TORCH_NCCL_AVOID_RECORD_STREAMS: "1"
   CUDA_DEVICE_MAX_CONNECTIONS: "1"
-  NCCL_DEBUG: "INFO"
-  NCCL_SOCKET_IFNAME: "eth,en,em,bond1"
-  NCCL_IB_GID_INDEX: "3"
-  NCCL_IB_SL: "3"
-  NCCL_NET_GDR_READ: "1"

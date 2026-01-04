@@ -165,7 +165,7 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorkerBase):
     ) -> AgentLoopOutput:
         # Completed, return directly
         if kwargs["output"] is not None and not kwargs["output"].extra_fields.get("is_cancel", False):
-            logger.info("In _partial_run_agent_loop, already completed, return directly!")
+            logger.info("In _partial_run_agent_loop, already completed, return derictly!")
             return kwargs["output"]
         try:
             with rollout_trace_attr(

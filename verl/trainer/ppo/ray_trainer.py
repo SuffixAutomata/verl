@@ -44,7 +44,6 @@ from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
-    compute_agentic_reward_mask_metrics,
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
@@ -271,8 +270,6 @@ class RayPPOTrainer:
     managing actor rollouts, critic training, and reward computation with Ray backend.
     Supports various model architectures including FSDP, Megatron, vLLM, and SGLang integration.
     """
-
-    FANOUT_INDEX_KEY = "__fanout_index__"
 
     # TODO: support each role have individual ray_worker_group_cls,
     # i.e., support different backend of different role
@@ -525,8 +522,6 @@ class RayPPOTrainer:
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
-        if "index" not in batch.non_tensor_batch:
-            batch.non_tensor_batch["index"] = np.arange(len(batch))
 
         # pop those keys for generation
         batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -541,79 +536,6 @@ class RayPPOTrainer:
             gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
 
         return gen_batch
-
-    def _filter_rollouts_to_roots(self, rollouts: DataProto) -> DataProto:
-        """Drop clone rollouts during validation metrics aggregation."""
-        role_key = "actor_role"
-        if role_key not in rollouts.non_tensor_batch:
-            return rollouts
-
-        roles = np.asarray(rollouts.non_tensor_batch[role_key], dtype=object)
-        mask = roles != "clone"
-        if not mask.any():
-            return rollouts
-        return rollouts.select_idxs(mask)
-
-    def _assert_grpo_fanout_compatibility(self, rollouts: DataProto):
-        """GRPO-style estimators assume fixed sampling; fail fast if clone fan-out is present."""
-        adv = self.config.algorithm.adv_estimator
-        if adv not in {
-            AdvantageEstimator.GRPO,
-            AdvantageEstimator.GRPO_VECTORIZED,
-            AdvantageEstimator.GRPO_PASSK,
-        }:
-            return
-
-        index_key = self.FANOUT_INDEX_KEY
-        if index_key not in rollouts.non_tensor_batch:
-            return
-
-        indices = np.asarray(rollouts.non_tensor_batch[index_key])
-        if indices.dtype == bool:
-            indices = np.nonzero(indices)[0]
-        indices = indices.reshape(-1)
-
-        if indices.size == 0:
-            return
-
-        _, counts = np.unique(indices, return_counts=True)
-        expected = self.config.actor_rollout_ref.rollout.n
-        if not np.all(counts == expected):
-            raise NotImplementedError(
-                "Clone fan-out rollouts are incompatible with GRPO-style estimators. "
-                "Disable clones or switch to a PPO+GAE style estimator."
-            )
-
-    def _align_batch_with_rollouts(
-        self, batch: DataProto, rollouts: DataProto, *, return_indices: bool = False
-    ) -> DataProto | tuple[DataProto, np.ndarray]:
-        """
-        Expand the original batch to match a fan-out rollout batch (e.g., when agent loops spawn clones).
-        Falls back to the legacy fixed repeat when no fan-out index is available.
-        """
-        index_key = self.FANOUT_INDEX_KEY
-        if index_key not in rollouts.non_tensor_batch:
-            indices = np.repeat(np.arange(len(batch)), self.config.actor_rollout_ref.rollout.n)
-            aligned = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-            return (aligned, indices) if return_indices else aligned
-
-        indices = np.asarray(rollouts.non_tensor_batch[index_key])
-        if indices.dtype == bool:
-            indices = np.nonzero(indices)[0]
-        indices = indices.reshape(-1).astype(np.int64, copy=False)
-
-        if indices.size == 0:
-            return batch.select_idxs(indices)
-
-        max_idx = indices.max(initial=-1)
-        min_idx = indices.min(initial=0)
-        if max_idx >= len(batch) or min_idx < 0:
-            raise ValueError(
-                f"Fan-out indices out of bounds: min={min_idx}, max={max_idx}, base batch={len(batch)}"
-            )
-
-        aligned = batch.select_idxs(indices)
-        return (aligned, indices) if return_indices else aligned
 
     def _validate(self):
         data_source_lst = []
@@ -634,15 +556,11 @@ class RayPPOTrainer:
                 test_batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
                 )
-            if "index" not in test_batch.non_tensor_batch:
-                test_batch.non_tensor_batch["index"] = np.arange(len(test_batch))
 
             # repeat test batch
             test_batch = test_batch.repeat(
                 repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
             )
-            if "fanout_index" not in test_batch.non_tensor_batch:
-                test_batch.non_tensor_batch["fanout_index"] = np.arange(len(test_batch))
 
             # we only do validation on rule-based rm
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
@@ -652,10 +570,13 @@ class RayPPOTrainer:
             input_ids = test_batch.batch["input_ids"]
             # TODO: Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            uids_full = test_batch.non_tensor_batch["uid"]
-            ground_truths_full = [
+            sample_inputs.extend(input_texts)
+            sample_uids.extend(test_batch.non_tensor_batch["uid"])
+
+            ground_truths = [
                 item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
             ]
+            sample_gts.extend(ground_truths)
 
             test_gen_batch = self._get_gen_batch(test_batch)
             test_gen_batch.meta_info = {
@@ -686,20 +607,9 @@ class RayPPOTrainer:
             print("validation generation end")
 
             # Store generated outputs
-            test_output_gen_batch = self._filter_rollouts_to_roots(test_output_gen_batch)
-            test_batch, alignment_indices = self._align_batch_with_rollouts(
-                test_batch, test_output_gen_batch, return_indices=True
-            )
-
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
-
-            # Align logged inputs/uids/ground_truths with the retained rollouts
-            alignment_indices_np = np.asarray(alignment_indices, dtype=int)
-            sample_inputs.extend([input_texts[i] for i in alignment_indices_np])
-            sample_uids.extend(uids_full[alignment_indices_np].tolist())
-            sample_gts.extend([ground_truths_full[i] for i in alignment_indices_np])
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
@@ -1106,36 +1016,6 @@ class RayPPOTrainer:
         global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1)  # (train_batch_size,)
         workload_lst = calculate_workload(global_seqlen_lst)
         world_size = self.actor_rollout_wg.world_size
-        if batch_size < world_size:
-            metrics[f"{logging_prefix}/skipped_small_batch"] = 1
-            return
-        # Keep the batch divisible by world_size; prefer dropping clones if present.
-        remainder = batch_size % world_size
-        if remainder != 0:
-            drop_count = remainder
-            drop_indices = []
-            roles = batch.non_tensor_batch.get("actor_role")
-            if roles is not None:
-                roles = np.asarray(roles, dtype=object)
-                clone_indices = np.where(roles == "clone")[0].tolist()
-                if clone_indices:
-                    clone_indices.sort(key=lambda idx: workload_lst[idx])
-                    drop_indices.extend(clone_indices[:drop_count])
-            if len(drop_indices) < drop_count:
-                remaining = drop_count - len(drop_indices)
-                remaining_candidates = [idx for idx in range(batch_size) if idx not in set(drop_indices)]
-                remaining_candidates.sort(key=lambda idx: workload_lst[idx])
-                drop_indices.extend(remaining_candidates[:remaining])
-            keep_indices = [idx for idx in range(batch_size) if idx not in set(drop_indices)]
-            batch.reorder(torch.tensor(keep_indices))
-            metrics[f"{logging_prefix}/dropped"] = drop_count
-            if roles is not None:
-                dropped_clones = sum(1 for idx in drop_indices if roles[idx] == "clone")
-                metrics[f"{logging_prefix}/dropped_clones"] = dropped_clones
-            attention_mask = batch.batch["attention_mask"]
-            batch_size = attention_mask.shape[0]
-            global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1)
-            workload_lst = calculate_workload(global_seqlen_lst)
         if keep_minibatch:
             # Decouple the DP balancing and mini-batching.
             minibatch_size = self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size")
@@ -1370,8 +1250,6 @@ class RayPPOTrainer:
                 batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
-                if "fanout_index" not in batch.non_tensor_batch:
-                    batch.non_tensor_batch["fanout_index"] = np.arange(len(batch))
 
                 gen_batch = self._get_gen_batch(batch)
 
@@ -1392,7 +1270,6 @@ class RayPPOTrainer:
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
-                        self._assert_grpo_fanout_compatibility(gen_batch_output)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -1405,8 +1282,6 @@ class RayPPOTrainer:
                                 gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
                             else:
                                 gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
-                            self._assert_grpo_fanout_compatibility(gen_baseline_output)
-                            batch = self._align_batch_with_rollouts(batch, gen_baseline_output)
                             batch = batch.union(gen_baseline_output)
                             # compute reward model score on batch
                             rm_scores = None
@@ -1428,8 +1303,8 @@ class RayPPOTrainer:
                             batch.batch["reward_baselines"] = reward_baseline_tensor
 
                             del rm_scores, gen_baseline_batch, gen_baseline_output
-                    # Align base batch with rollout fan-out (e.g., clone-generated rollouts)
-                    batch = self._align_batch_with_rollouts(batch, gen_batch_output)
+                    # repeat to align with repeated responses in rollout
+                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
@@ -1641,8 +1516,6 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
-                if OmegaConf.select(self.config, "trainer.debug_agentic_reward_mask_metrics", default=False):
-                    metrics.update(compute_agentic_reward_mask_metrics(batch))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
