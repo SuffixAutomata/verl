@@ -36,7 +36,7 @@ from verl.utils.hdfs_io import copy, makedirs
 DEFAULT_SYSTEM_PROMPT = (
     "You are the root agent. Delegate the arithmetic by calling the tool `spawn_clone` as many times as needed. "
     "Coordinate the steps until the final value is computed. "
-    "Put the final answer in the format `#### <value>`."
+    "Put the final answer in the format `Answer: <value>`."
 )
 
 

@@ -158,6 +158,91 @@ def _compute_agentic_clone_metrics(batch: DataProto) -> dict[str, Any]:
     return metrics
 
 
+def _compute_tool_json_metrics(batch: DataProto) -> dict[str, Any]:
+    total_calls = batch.non_tensor_batch.get("tool_json_total_calls")
+    repair_counts = batch.non_tensor_batch.get("tool_json_repair_count")
+    parse_failures = batch.non_tensor_batch.get("tool_json_parse_failures")
+    if total_calls is None and repair_counts is None and parse_failures is None:
+        return {}
+
+    batch_size = len(batch)
+
+    def _coerce(values):
+        if values is None:
+            return np.zeros(batch_size, dtype=np.float32)
+        arr = np.asarray(values, dtype=object)
+        return np.array([float(v) if v is not None else 0.0 for v in arr], dtype=np.float32)
+
+    total_calls_arr = _coerce(total_calls)
+    repair_counts_arr = _coerce(repair_counts)
+    parse_failures_arr = _coerce(parse_failures)
+
+    metrics: dict[str, Any] = {}
+
+    def _add_stats(prefix: str, values: np.ndarray) -> None:
+        metrics[f"{prefix}/mean"] = float(values.mean())
+        metrics[f"{prefix}/max"] = float(values.max())
+        metrics[f"{prefix}/min"] = float(values.min())
+        metrics[f"{prefix}/total"] = float(values.sum())
+
+    _add_stats("tool_json/repairs", repair_counts_arr)
+    _add_stats("tool_json/parse_failures", parse_failures_arr)
+    _add_stats("tool_json/total_calls", total_calls_arr)
+
+    with_calls = total_calls_arr > 0
+    if with_calls.any():
+        metrics["tool_json/repair_rate"] = float((repair_counts_arr[with_calls] / total_calls_arr[with_calls]).mean())
+        metrics["tool_json/parse_failure_rate"] = float(
+            (parse_failures_arr[with_calls] / total_calls_arr[with_calls]).mean()
+        )
+
+    return metrics
+
+
+def compute_agentic_reward_mask_metrics(batch: DataProto) -> dict[str, Any]:
+    roles = batch.non_tensor_batch.get("actor_role")
+    if roles is None:
+        return {}
+
+    if "response_mask" not in batch.batch or "attention_mask" not in batch.batch:
+        return {}
+
+    roles = np.asarray(roles, dtype=object)
+    if roles.size == 0:
+        return {}
+
+    response_mask = batch.batch["response_mask"].bool()
+    response_length = batch.batch["attention_mask"][:, -response_mask.size(-1) :].sum(dim=-1).long()
+
+    valid = response_length > 0
+    if not torch.any(valid):
+        return {}
+
+    reward_index = response_length - 1
+    reward_masked = torch.zeros_like(valid, dtype=torch.bool)
+
+    valid_rows = torch.nonzero(valid, as_tuple=False).squeeze(-1)
+    reward_cols = reward_index[valid]
+    reward_masked[valid_rows] = ~response_mask[valid_rows, reward_cols]
+
+    reward_masked_np = reward_masked.detach().cpu().numpy()
+    valid_np = valid.detach().cpu().numpy()
+
+    metrics: dict[str, Any] = {}
+
+    def _add_rate(name: str, mask: np.ndarray) -> None:
+        mask = mask & valid_np
+        if not mask.any():
+            return
+        metrics[f"agentic/reward_masked_rate/{name}"] = float(reward_masked_np[mask].mean())
+
+    _add_rate("all", np.ones_like(valid_np, dtype=bool))
+    _add_rate("root", roles == "root")
+    _add_rate("clone", roles == "clone")
+
+    return metrics
+
+
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
@@ -303,6 +388,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
     metrics.update(_compute_agentic_clone_metrics(batch))
+    metrics.update(_compute_tool_json_metrics(batch))
 
     return metrics
 

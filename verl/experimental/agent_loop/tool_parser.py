@@ -16,6 +16,7 @@ import json
 import logging
 import os
 from abc import ABC, abstractmethod
+from typing import Any, Callable, Optional
 
 import regex
 from pydantic import BaseModel
@@ -24,6 +25,27 @@ from verl.utils.rollout_trace import rollout_trace_op
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+_REPAIR_JSON_FN: Optional[Callable[..., Any]] = None
+_REPAIR_JSON_IMPORT_ATTEMPTED = False
+
+
+def _get_repair_json() -> Optional[Callable[..., Any]]:
+    global _REPAIR_JSON_FN, _REPAIR_JSON_IMPORT_ATTEMPTED
+
+    if _REPAIR_JSON_IMPORT_ATTEMPTED:
+        return _REPAIR_JSON_FN
+
+    _REPAIR_JSON_IMPORT_ATTEMPTED = True
+    try:
+        from json_repair import repair_json
+    except ModuleNotFoundError as exc:
+        logger.warning("json_repair not available; tool JSON repair disabled: %s", exc)
+        _REPAIR_JSON_FN = None
+        return None
+
+    _REPAIR_JSON_FN = repair_json
+    return _REPAIR_JSON_FN
 
 
 class FunctionCall(BaseModel):
@@ -37,6 +59,9 @@ class FunctionCall(BaseModel):
 
     name: str
     """The name of the function to call."""
+
+    repaired: bool = False
+    """Whether the tool call payload required JSON repair."""
 
 
 class ToolParser(ABC):
@@ -93,12 +118,68 @@ class HermesToolParser(ToolParser):
         matches = self.tool_call_regex.findall(text)
         function_calls = []
         for match in matches:
+            repaired = False
             try:
                 function_call = json.loads(match)
-                name, arguments = function_call["name"], function_call["arguments"]
-                function_calls.append(FunctionCall(name=name, arguments=json.dumps(arguments, ensure_ascii=False)))
             except Exception as e:
-                logger.error(f"Failed to decode tool call: {e}")
+                repair_json = _get_repair_json()
+                if repair_json is None:
+                    logger.error(f"Failed to decode tool call: {e}, match: {match}, text: {text}")
+                    continue
+                try:
+                    function_call = repair_json(match, skip_json_loads=True, return_objects=True)
+                    repaired = True
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(f"Failed to repair tool call: {exc}, match: {match}, text: {text}")
+                    continue
+
+            if isinstance(function_call, str):
+                try:
+                    function_call = json.loads(function_call)
+                except Exception as e:
+                    repair_json = _get_repair_json()
+                    if repair_json is None:
+                        logger.error(f"Failed to decode tool call: {e}, match: {match}, text: {text}")
+                        continue
+                    try:
+                        function_call = repair_json(function_call, skip_json_loads=True, return_objects=True)
+                        repaired = True
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error(f"Failed to repair tool call: {exc}, match: {match}, text: {text}")
+                        continue
+
+            if not isinstance(function_call, dict):
+                logger.error(f"Failed to decode tool call: payload is not object, match: {match}, text: {text}")
+                continue
+
+            name = function_call.get("name")
+            arguments = function_call.get("arguments")
+            if not name or arguments is None:
+                logger.error(f"Failed to decode tool call: missing fields, match: {match}, text: {text}")
+                continue
+
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except Exception as e:
+                    repair_json = _get_repair_json()
+                    if repair_json is None:
+                        logger.error(f"Failed to decode tool call arguments: {e}, match: {match}, text: {text}")
+                        continue
+                    try:
+                        arguments = repair_json(arguments, skip_json_loads=True, return_objects=True)
+                        repaired = True
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error(f"Failed to repair tool call arguments: {exc}, match: {match}, text: {text}")
+                        continue
+
+            try:
+                args_json = json.dumps(arguments, ensure_ascii=False)
+            except Exception as e:
+                logger.error(f"Failed to serialize tool call arguments: {e}, match: {match}, text: {text}")
+                continue
+
+            function_calls.append(FunctionCall(name=name, arguments=args_json, repaired=repaired))
 
         # remaing text exclude tool call tokens
         content = self.tool_call_regex.sub("", text)

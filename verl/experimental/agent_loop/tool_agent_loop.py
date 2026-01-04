@@ -512,14 +512,35 @@ class ToolAgentLoop(AgentLoopBase):
     ) -> ToolInvocationResult:
         """Call tool and return tool response."""
         tool_name = tool_call.name
+        tool_repaired = bool(getattr(tool_call, "repaired", False))
+        agent_data.extra_fields["tool_json_total_calls"] = agent_data.extra_fields.get("tool_json_total_calls", 0) + 1
         try:
             tool_args = json.loads(tool_call.arguments)
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            agent_data.extra_fields["tool_json_parse_failures"] = (
+                agent_data.extra_fields.get("tool_json_parse_failures", 0) + 1
+            )
             logger.warning(f"Error decoding tool arguments for {tool_name}: {e}")
             return ToolInvocationResult(
                 response=ToolResponse(text=f"Error when decoding tool arguments for {tool_name}: {e}"),
                 reward=0.0,
                 extra={},
+            )
+
+        if not isinstance(tool_args, dict):
+            agent_data.extra_fields["tool_json_parse_failures"] = (
+                agent_data.extra_fields.get("tool_json_parse_failures", 0) + 1
+            )
+            logger.warning(f"Error decoding tool arguments for {tool_name}: arguments must be an object")
+            return ToolInvocationResult(
+                response=ToolResponse(text=f"Error when decoding tool arguments for {tool_name}: arguments not object"),
+                reward=0.0,
+                extra={},
+            )
+
+        if tool_repaired:
+            agent_data.extra_fields["tool_json_repair_count"] = (
+                agent_data.extra_fields.get("tool_json_repair_count", 0) + 1
             )
 
         # Handle cloning as a built-in tool
@@ -629,6 +650,8 @@ class ToolAgentLoop(AgentLoopBase):
             ),
             "final_answer_markers": final_markers,
             "reward_function": _get("reward_function", None),
+            "debug_reward_fields": _get("debug_reward_fields", False),
+            "json_repair_penalty": _get("json_repair_penalty", 0.0),
         }
 
     @classmethod
@@ -648,12 +671,12 @@ class ToolAgentLoop(AgentLoopBase):
                         ),
                         "shared_context": OpenAIFunctionPropertySchema(
                             type="string",
-                            description="Minimal context to share with each clone to avoid re-tokenizing long history.",
+                            description="Context to share. Only include if absolutely necessary.",
                         ),
-                        "allow_tools": OpenAIFunctionPropertySchema(
-                            type="boolean",
-                            description="Let clones use the same toolset; defaults to config.",
-                        ),
+                        # "allow_tools": OpenAIFunctionPropertySchema(
+                        #     type="boolean",
+                        #     description="Let clones use the same toolset; defaults to config.",
+                        # ),
                     },
                     required=["objectives"],
                 ),
@@ -684,7 +707,7 @@ class ToolAgentLoop(AgentLoopBase):
     def _load_reward_fn(cls, clone_config: dict[str, Any]):
         """Load a user-provided reward function or fall back to a default no-op."""
 
-        def _default_reward_fn(root_answer: str, clone_rollouts: list[AgentLoopOutput], metadata: dict[str, Any]):
+        def _default_reward_fn(root_answer: str, root_output: AgentLoopOutput, clone_rollouts: list[AgentLoopOutput]):
             return 0.0
 
         path = clone_config.get("reward_function")
@@ -717,24 +740,42 @@ class ToolAgentLoop(AgentLoopBase):
     def _assign_rewards(self, root_output: AgentLoopOutput, clone_rollouts: list[AgentLoopOutput]) -> float:
         """Assign a single reward to root and all clones, bypassing default reward loop."""
         try:
-            decoded = self.tokenizer.decode(root_output.response_ids, skip_special_tokens=True)
-            root_answer = self._strip_thinking(decoded)
+            decoded_raw = self.tokenizer.decode(root_output.response_ids, skip_special_tokens=True)
+            decoded_masked = decoded_raw
+            if root_output.response_mask and root_output.response_ids:
+                masked_ids = [
+                    token_id for token_id, mask in zip(root_output.response_ids, root_output.response_mask) if mask
+                ]
+                decoded_masked = self.tokenizer.decode(masked_ids, skip_special_tokens=True)
+            root_answer = self._strip_thinking(decoded_masked)
         except Exception as exc:  # noqa: BLE001
             logger.error("[SHOULDN'T HAPPEN] Failed to decode root answer for reward fn: %s", exc)
+            decoded_raw = ""
+            decoded_masked = ""
             root_answer = ""
 
         try:
             reward_value = self.clone_reward_fn(
                 root_answer,
-                clone_rollouts or [],
-                {
-                    "root_extra": root_output.extra_fields,
-                    "num_clones": len(clone_rollouts or []),
-                },
+                root_output,
+                clone_rollouts or []
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Reward function raised; defaulting to 0.0: %s", exc)
             reward_value = 0.0
+
+        if self.clone_config.get("debug_reward_fields", False):
+            response_mask = root_output.response_mask or []
+            mask_tokens = int(sum(response_mask)) if response_mask else 0
+            total_tokens = int(len(response_mask))
+            root_output.extra_fields["reward_debug_root_decoded_raw"] = decoded_raw
+            root_output.extra_fields["reward_debug_root_decoded_masked"] = decoded_masked
+            root_output.extra_fields["reward_debug_root_answer"] = root_answer
+            root_output.extra_fields["reward_debug_response_mask_tokens"] = mask_tokens
+            root_output.extra_fields["reward_debug_response_tokens"] = total_tokens
+            root_output.extra_fields["reward_debug_response_mask_ratio"] = (
+                float(mask_tokens) / float(total_tokens) if total_tokens else 0.0
+            )
 
         if isinstance(reward_value, dict) and "reward" in reward_value:
             reward_value = reward_value["reward"]
@@ -742,6 +783,15 @@ class ToolAgentLoop(AgentLoopBase):
             reward_value = float(reward_value)
         except Exception:
             reward_value = 0.0
+
+        repair_penalty = self.clone_config.get("json_repair_penalty", 0.0)
+        if repair_penalty:
+            repair_count = int(root_output.extra_fields.get("tool_json_repair_count", 0) or 0)
+            if repair_count:
+                penalty_value = float(repair_penalty) * float(repair_count)
+                reward_value -= penalty_value
+                if self.clone_config.get("debug_reward_fields", False):
+                    root_output.extra_fields["reward_debug_json_repair_penalty"] = penalty_value
 
         return reward_value
 

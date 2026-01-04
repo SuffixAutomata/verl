@@ -32,17 +32,8 @@ def _coerce_ground_truth(ground_truth: Any) -> Any:
     return ground_truth
 
 
-def _normalize_root_answer_for_scoring(data_source: str | None, root_answer: str) -> str:
-    if not root_answer:
-        return root_answer
-    if data_source == "openai/gsm8k" and "####" not in root_answer:
-        # GSM8K's default scorer extracts answers from the "#### <num>" pattern.
-        return f"#### {root_answer.strip()}"
-    return root_answer
-
-
 def clone_accuracy_reward(
-    root_answer: str, clone_rollouts: list[Any], metadata: dict[str, Any]
+    root_answer: str, root_output: Any, clone_rollouts: list[Any]
 ) -> dict[str, Any] | float:
     """
     Compute a single scalar reward for the root + all clones.
@@ -60,7 +51,7 @@ def clone_accuracy_reward(
         recorded in reward_extra_info.
     """
 
-    root_extra = metadata.get("root_extra") or {}
+    root_extra = root_output.extra_fields
     reward_model = root_extra.get("reward_model") or {}
     data_source = root_extra.get("data_source") or reward_model.get("data_source")
     ground_truth = _coerce_ground_truth(reward_model.get("ground_truth"))
@@ -69,15 +60,21 @@ def clone_accuracy_reward(
         return {"reward": 0.0, "reason": "missing_ground_truth"}
 
     try:
-        score = 1.0 if int(root_answer.strip()) == int(ground_truth.strip()) else 0.1
+        score = 1.0 if int(root_answer.strip()) == int(ground_truth.strip()) else 1.0/20.0
     except Exception:
         # Fallback: exact/substring match
         score = 1.0 if str(ground_truth).strip() in root_answer else 0.0
+    
+    # penalize <2 clones
+    if len(clone_rollouts) == 0:
+        score -= 0.25
+    elif len(clone_rollouts) == 1:
+        score -= 0.15
 
     return {
         "reward": score,
         "score": score,
-        "num_clones": metadata.get("num_clones", len(clone_rollouts)),
+        "num_clones": len(clone_rollouts),
         "ground_truth": ground_truth,
     }
 

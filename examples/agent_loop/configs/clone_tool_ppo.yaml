@@ -93,6 +93,7 @@ actor_rollout_ref:
       tool_config_path: null
       interaction_config_path: null
       clone:
+        debug_reward_fields: True
         enable: True
         allow_tool_use: True
         allow_nested_clones: False
@@ -137,6 +138,7 @@ trainer:
   save_freq: 50
   test_freq: 50
   logger: tensorboard
+  debug_agentic_reward_mask_metrics: True
 
 algorithm:
   adv_estimator: gae
