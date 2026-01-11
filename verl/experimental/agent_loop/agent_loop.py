@@ -40,6 +40,7 @@ from verl.utils.fs import copy_to_local
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.rollout_trace import (
     RolloutTraceConfig,
+    rollout_trace_add_tags,
     rollout_trace_attr,
     rollout_trace_op,
 )
@@ -144,6 +145,8 @@ class AgentLoopOutput(BaseModel):
     """Number of chat turns, including user, assistant, tool."""
     metrics: AgentLoopMetrics
     """Auxiliary performance metrics"""
+    rollout_trace_tags: dict[str, Any] = {}
+    """Extra tags to attach to the rollout trace."""
     extra_fields: dict[str, Any] = {}
     """Extra fields for dynamic addition."""
 
@@ -435,9 +438,13 @@ class AgentLoopWorkerBase:
                 processor=self.processor,
             )
             outputs = await agent_loop.run(sampling_params, **kwargs)
+            normalized_outputs = self._normalize_agent_outputs(outputs)
+            merged_tags = self._merge_rollout_trace_tags(normalized_outputs)
+            if merged_tags:
+                rollout_trace_add_tags(merged_tags)
             processed_outputs = [
                 await self._agent_loop_postprocess(output, **kwargs)
-                for output in self._normalize_agent_outputs(outputs)
+                for output in normalized_outputs
             ]
             return processed_outputs if len(processed_outputs) > 1 else processed_outputs[0]
 
@@ -456,6 +463,16 @@ class AgentLoopWorkerBase:
                 raise TypeError("All items returned by AgentLoop.run must be AgentLoopOutput instances.")
             return outputs_list
         raise TypeError("AgentLoop.run must return AgentLoopOutput or a sequence of AgentLoopOutput.")
+
+    @staticmethod
+    def _merge_rollout_trace_tags(outputs: Sequence[AgentLoopOutput]) -> dict[str, Any]:
+        merged_tags: dict[str, Any] = {}
+        for output in outputs:
+            tags = output.rollout_trace_tags or {}
+            if not isinstance(tags, dict):
+                raise TypeError("rollout_trace_tags must be a dict when provided.")
+            merged_tags.update(tags)
+        return merged_tags
 
     async def _agent_loop_postprocess(self, output, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""

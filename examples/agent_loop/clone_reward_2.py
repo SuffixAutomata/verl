@@ -23,8 +23,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from verl.utils.reward_score import default_compute_score
-
 import math
 
 
@@ -32,6 +30,32 @@ def _coerce_ground_truth(ground_truth: Any) -> Any:
     if isinstance(ground_truth, list) and len(ground_truth) == 1:
         return ground_truth[0]
     return ground_truth
+
+
+ROOT_TOKEN_PENALTY_THRESHOLD = 1024
+ROOT_TOKEN_PENALTY_RAMP = 1024
+ROOT_TOKEN_PENALTY_MAX = 0.3
+
+
+def _sum_mask_tokens(mask: Any) -> int:
+    if mask is None:
+        return 0
+    if hasattr(mask, "sum"):
+        try:
+            mask_sum = mask.sum()
+            return int(mask_sum.item()) if hasattr(mask_sum, "item") else int(mask_sum)
+        except TypeError:
+            pass
+    return int(sum(int(value) for value in mask))
+
+
+def _root_token_penalty(root_generated_tokens: int, threshold: int, ramp: int, max_penalty: float) -> float:
+    if root_generated_tokens <= threshold:
+        return 0.0
+    if ramp <= 0:
+        return float(max_penalty)
+    excess = float(root_generated_tokens - threshold)
+    return float(max_penalty) * (1.0 - math.exp(-excess / float(ramp)))
 
 
 def clone_accuracy_reward(
@@ -67,17 +91,25 @@ def clone_accuracy_reward(
     except Exception:
         # Fallback: exact/substring match
         score = 1.0 if str(ground_truth).strip() in root_answer else 0.0
-    
-    # penalize <2 clones
-    if len(clone_rollouts) == 0:
-        score -= 0.25
-    elif len(clone_rollouts) == 1:
-        score -= 0.15
+
+    penalty_cfg = root_extra.get("root_token_penalty") or reward_model.get("root_token_penalty") or {
+        "threshold": 512, "ramp": 256, "max_penalty": 0.3
+    }
+    threshold = int(penalty_cfg.get("threshold", ROOT_TOKEN_PENALTY_THRESHOLD))
+    ramp = int(penalty_cfg.get("ramp", ROOT_TOKEN_PENALTY_RAMP))
+    max_penalty = float(penalty_cfg.get("max_penalty", ROOT_TOKEN_PENALTY_MAX))
+    root_generated_tokens = _sum_mask_tokens(getattr(root_output, "response_mask", None))
+    token_penalty = _root_token_penalty(root_generated_tokens, threshold, ramp, max_penalty)
+    score -= token_penalty
 
     return {
         "reward": score,
         "score": score,
         "num_clones": len(clone_rollouts),
+        # "root_generated_tokens": root_generated_tokens,
+        # "root_token_penalty": token_penalty,
+        # "root_token_penalty_threshold": threshold,
+        # "root_token_penalty_ramp": ramp,
         "ground_truth": ground_truth,
     }
 

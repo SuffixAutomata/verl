@@ -35,6 +35,7 @@ from verl.experimental.agent_loop.prometheus_utils import update_prometheus_conf
 from verl.protocol import DataProto
 from verl.single_controller.ray import RayWorkerGroup
 from verl.utils.rollout_trace import (
+    rollout_trace_add_tags,
     rollout_trace_attr,
     rollout_trace_op,
 )
@@ -190,6 +191,8 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorkerBase):
                 output: AgentLoopOutput = await agent_loop.run(
                     sampling_params, cancellation_event=self.cancellation_event, **kwargs
                 )
+                if output.rollout_trace_tags:
+                    rollout_trace_add_tags(output.rollout_trace_tags)
                 if not output.extra_fields.get("is_cancel", False):
                     kwargs.pop("output", None)
                     output = await self._agent_loop_postprocess(output, **kwargs)

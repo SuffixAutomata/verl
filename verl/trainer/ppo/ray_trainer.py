@@ -25,7 +25,7 @@ from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import ray
@@ -183,6 +183,108 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
+def _compute_grpo_advantage_with_clones(
+    data: DataProto,
+    adv_estimator: AdvantageEstimator,
+    norm_adv_by_std_in_grpo: bool,
+    config: Optional[AlgoConfig],
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Compute GRPO advantages on root rollouts, then broadcast to clone generations."""
+    roles = data.non_tensor_batch.get("actor_role")
+    if roles is None:
+        return None
+
+    roles = np.asarray(roles, dtype=object)
+    if roles.size == 0 or not np.any(roles == "clone"):
+        return None
+
+    request_ids = data.non_tensor_batch.get("request_id")
+    parent_request_ids = data.non_tensor_batch.get("parent_request_id")
+    if request_ids is None or parent_request_ids is None:
+        raise ValueError(
+            "Clone rollouts detected but request_id/parent_request_id missing; "
+            "cannot broadcast GRPO advantages."
+        )
+
+    if "uid" not in data.non_tensor_batch:
+        raise ValueError("GRPO requires uid in non_tensor_batch when clones are present.")
+
+    request_ids = np.asarray(request_ids, dtype=object)
+    parent_request_ids = np.asarray(parent_request_ids, dtype=object)
+    root_mask = roles == "root"
+    if not root_mask.any():
+        raise ValueError("Clone rollouts detected but no root rollouts found.")
+
+    token_level_rewards = data.batch["token_level_rewards"]
+    response_mask = data.batch["response_mask"]
+
+    root_mask_t = torch.as_tensor(root_mask, device=response_mask.device)
+    root_rewards = token_level_rewards[root_mask_t]
+    root_response_mask = response_mask[root_mask_t]
+    root_index = np.asarray(data.non_tensor_batch["uid"], dtype=object)[root_mask]
+
+    if adv_estimator == AdvantageEstimator.GRPO:
+        root_adv, _ = core_algos.compute_grpo_outcome_advantage(
+            token_level_rewards=root_rewards,
+            response_mask=root_response_mask,
+            index=root_index,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+    elif adv_estimator == AdvantageEstimator.GRPO_VECTORIZED:
+        root_adv, _ = core_algos.compute_grpo_vectorized_outcome_advantage(
+            token_level_rewards=root_rewards,
+            response_mask=root_response_mask,
+            index=root_index,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+    elif adv_estimator == AdvantageEstimator.GRPO_PASSK:
+        root_adv, _ = core_algos.compute_grpo_passk_outcome_advantage(
+            token_level_rewards=root_rewards,
+            response_mask=root_response_mask,
+            index=root_index,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
+        )
+    else:
+        return None
+
+    root_lengths = root_response_mask.sum(dim=-1).clamp(min=1)
+    root_scalars = (root_adv.sum(dim=-1) / root_lengths).detach()
+
+    root_request_ids = request_ids[root_mask]
+    root_scalar_map = {rid: root_scalars[i].item() for i, rid in enumerate(root_request_ids)}
+    parent_map = {rid: parent_request_ids[i] for i, rid in enumerate(request_ids) if rid is not None}
+    resolved_cache: dict[Any, float] = {}
+
+    def _resolve_scalar(req_id) -> float:
+        current = req_id
+        seen = set()
+        while current is not None and current not in seen:
+            if current in resolved_cache:
+                return resolved_cache[current]
+            if current in root_scalar_map:
+                resolved_cache[current] = root_scalar_map[current]
+                return root_scalar_map[current]
+            seen.add(current)
+            current = parent_map.get(current)
+        return 0.0
+
+    bsz = response_mask.size(0)
+    scalars = torch.zeros(bsz, device=response_mask.device, dtype=root_adv.dtype)
+    scalars[root_mask_t] = root_scalars
+
+    clone_mask = roles == "clone"
+    if clone_mask.any():
+        clone_mask_t = torch.as_tensor(clone_mask, device=response_mask.device)
+        clone_parent_ids = parent_request_ids[clone_mask]
+        clone_scalars = [_resolve_scalar(pid) for pid in clone_parent_ids]
+        scalars[clone_mask_t] = torch.tensor(clone_scalars, device=response_mask.device, dtype=root_adv.dtype)
+
+    advantages = scalars.unsqueeze(-1) * response_mask
+    returns = advantages
+    return advantages, returns
+
+
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -213,6 +315,24 @@ def compute_advantage(
     # Back-compatible with trainers that do not compute response mask in fit
     if "response_mask" not in data.batch.keys():
         data.batch["response_mask"] = compute_response_mask(data)
+
+    if adv_estimator in {
+        AdvantageEstimator.GRPO,
+        AdvantageEstimator.GRPO_VECTORIZED,
+        AdvantageEstimator.GRPO_PASSK,
+    }:
+        clone_adv = _compute_grpo_advantage_with_clones(
+            data,
+            adv_estimator=adv_estimator,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
+        )
+        if clone_adv is not None:
+            advantages, returns = clone_adv
+            data.batch["advantages"] = advantages
+            data.batch["returns"] = returns
+            return data
+
     # prepare response group
     if adv_estimator == AdvantageEstimator.GAE:
         # Compute advantages and returns using Generalized Advantage Estimation (GAE)
@@ -553,36 +673,6 @@ class RayPPOTrainer:
         if not mask.any():
             return rollouts
         return rollouts.select_idxs(mask)
-
-    def _assert_grpo_fanout_compatibility(self, rollouts: DataProto):
-        """GRPO-style estimators assume fixed sampling; fail fast if clone fan-out is present."""
-        adv = self.config.algorithm.adv_estimator
-        if adv not in {
-            AdvantageEstimator.GRPO,
-            AdvantageEstimator.GRPO_VECTORIZED,
-            AdvantageEstimator.GRPO_PASSK,
-        }:
-            return
-
-        index_key = self.FANOUT_INDEX_KEY
-        if index_key not in rollouts.non_tensor_batch:
-            return
-
-        indices = np.asarray(rollouts.non_tensor_batch[index_key])
-        if indices.dtype == bool:
-            indices = np.nonzero(indices)[0]
-        indices = indices.reshape(-1)
-
-        if indices.size == 0:
-            return
-
-        _, counts = np.unique(indices, return_counts=True)
-        expected = self.config.actor_rollout_ref.rollout.n
-        if not np.all(counts == expected):
-            raise NotImplementedError(
-                "Clone fan-out rollouts are incompatible with GRPO-style estimators. "
-                "Disable clones or switch to a PPO+GAE style estimator."
-            )
 
     def _align_batch_with_rollouts(
         self, batch: DataProto, rollouts: DataProto, *, return_indices: bool = False
@@ -1392,7 +1482,6 @@ class RayPPOTrainer:
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
-                        self._assert_grpo_fanout_compatibility(gen_batch_output)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -1405,7 +1494,6 @@ class RayPPOTrainer:
                                 gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
                             else:
                                 gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
-                            self._assert_grpo_fanout_compatibility(gen_baseline_output)
                             batch = self._align_batch_with_rollouts(batch, gen_baseline_output)
                             batch = batch.union(gen_baseline_output)
                             # compute reward model score on batch

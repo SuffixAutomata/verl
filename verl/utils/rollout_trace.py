@@ -18,9 +18,10 @@ import functools
 import inspect
 import os
 from contextvars import ContextVar
-from typing import Optional
+from typing import Any, Optional
 
 _trace_enabled: ContextVar[bool] = ContextVar("_trace_enabled", default=True)
+_active_mlflow_trace_id: ContextVar[Optional[str]] = ContextVar("_active_mlflow_trace_id", default=None)
 
 
 class RolloutTraceConfig:
@@ -169,14 +170,76 @@ def rollout_trace_attr(
 
         with mlflow.start_span(name=name) as span:
             trace_id = span.trace_id
-            for key, value in attributes.items():
-                mlflow.set_trace_tag(trace_id, str(key), str(value))
-            yield
+            token = _active_mlflow_trace_id.set(trace_id)
+            try:
+                for key, value in attributes.items():
+                    mlflow.set_trace_tag(trace_id, str(key), str(value))
+                yield
+            finally:
+                _active_mlflow_trace_id.reset(token)
     else:
         yield
 
 
+def rollout_trace_add_tags(tags: dict[str, Any]) -> None:
+    """Attach additional tags to the active rollout trace, if supported."""
+    if not tags:
+        return
+    if not _trace_enabled.get():
+        return
+    backend = RolloutTraceConfig.get_backend()
+    if backend is None:
+        return
+
+    if backend == "mlflow":
+        trace_id = _active_mlflow_trace_id.get()
+        if trace_id is None:
+            return
+        import mlflow
+
+        for key, value in tags.items():
+            mlflow.set_trace_tag(trace_id, str(key), str(value))
+    elif backend == "weave":
+        try:
+            from weave.trace.context import call_context
+        except Exception:
+            return
+        current_attrs = call_context.call_attributes.get()
+        if isinstance(current_attrs, dict):
+            current_attrs.update({str(key): value for key, value in tags.items()})
+
+
 def rollout_trace_op(func):
+    def sanitize_inputs_for_logging(inputs, enable_token2text):
+        if not enable_token2text or "raw_prompt_ids" not in inputs:
+            return inputs
+        sanitized = dict(inputs)
+        sanitized.pop("raw_prompt_ids", None)
+        return sanitized
+
+    def sanitize_output_for_logging(output, enable_token2text):
+        if not enable_token2text:
+            return output
+        drop_keys = {"prompt_ids", "response_ids", "response_mask"}
+        if isinstance(output, dict):
+            return {
+                key: sanitize_output_for_logging(value, enable_token2text)
+                for key, value in output.items()
+                if key not in drop_keys
+            }
+        if isinstance(output, list):
+            return [sanitize_output_for_logging(item, enable_token2text) for item in output]
+        if isinstance(output, tuple):
+            return tuple(sanitize_output_for_logging(item, enable_token2text) for item in output)
+        if hasattr(output, "__dict__"):
+            result_dict = dict(vars(output))
+            return {
+                key: sanitize_output_for_logging(value, enable_token2text)
+                for key, value in result_dict.items()
+                if key not in drop_keys
+            }
+        return output
+
     @functools.wraps(func)
     async def async_wrapper(self, *args, **kwargs):
         if not _trace_enabled.get():
@@ -192,6 +255,7 @@ def rollout_trace_op(func):
         bound_args.apply_defaults()
         inputs = dict(bound_args.arguments)
         del inputs["self"]
+        inputs_for_logging = sanitize_inputs_for_logging(inputs, enable_token2text)
 
         async def add_token2text(self, result):
             if hasattr(result, "prompt_ids") and hasattr(self, "tokenizer") and hasattr(self.tokenizer, "decode"):
@@ -212,13 +276,14 @@ def rollout_trace_op(func):
             from weave.trace.context import call_context
 
             cur_attributes = {**call_context.call_attributes.get()}
-            call = tracer.create_call(op=func.__qualname__, inputs=inputs, attributes=cur_attributes)
+            call = tracer.create_call(op=func.__qualname__, inputs=inputs_for_logging, attributes=cur_attributes)
             try:
                 result = await func(self, *args, **kwargs)
 
                 if enable_token2text:
                     _result = await add_token2text(self, result)
-                    tracer.finish_call(call, output=_result)
+                    logged_output = sanitize_output_for_logging(_result, enable_token2text)
+                    tracer.finish_call(call, output=logged_output)
                 else:
                     tracer.finish_call(call, output=result)
 
@@ -231,11 +296,11 @@ def rollout_trace_op(func):
             import mlflow
 
             with mlflow.start_span(name=func.__qualname__) as span:
-                span.set_inputs(inputs)
+                span.set_inputs(inputs_for_logging)
                 result = await func(self, *args, **kwargs)
                 if enable_token2text:
                     _result = await add_token2text(self, result)
-                    span.set_outputs(_result)
+                    span.set_outputs(sanitize_output_for_logging(_result, enable_token2text))
                 else:
                     span.set_outputs(result)
 
@@ -250,6 +315,7 @@ def rollout_trace_op(func):
             return func(self, *args, **kwargs)
 
         backend = RolloutTraceConfig.get_backend()
+        enable_token2text = RolloutTraceConfig.enable_token2text()
         if backend is None:
             return func(self, *args, **kwargs)
 
@@ -258,16 +324,18 @@ def rollout_trace_op(func):
         bound_args.apply_defaults()
         inputs = dict(bound_args.arguments)
         del inputs["self"]
+        inputs_for_logging = sanitize_inputs_for_logging(inputs, enable_token2text)
 
         if backend == "weave":
             tracer = RolloutTraceConfig.get_client()
             from weave.trace.context import call_context
 
             cur_attributes = {**call_context.call_attributes.get()}
-            call = tracer.create_call(op=func.__qualname__, inputs=inputs, attributes=cur_attributes)
+            call = tracer.create_call(op=func.__qualname__, inputs=inputs_for_logging, attributes=cur_attributes)
             try:
                 result = func(self, *args, **kwargs)
-                tracer.finish_call(call, output=result)
+                logged_output = sanitize_output_for_logging(result, enable_token2text)
+                tracer.finish_call(call, output=logged_output)
                 return result
             except Exception as e:
                 tracer.finish_call(call, exception=e)
@@ -275,6 +343,12 @@ def rollout_trace_op(func):
         elif backend == "mlflow":
             import mlflow
 
+            if enable_token2text:
+                with mlflow.start_span(name=func.__qualname__) as span:
+                    span.set_inputs(inputs_for_logging)
+                    result = func(self, *args, **kwargs)
+                    span.set_outputs(sanitize_output_for_logging(result, enable_token2text))
+                return result
             return mlflow.trace(func)(self, *args, **kwargs)
         else:
             return func(self, *args, **kwargs)

@@ -9,6 +9,7 @@
 **/playground
 **/wandb
 **/tensorboard_log
+**/mlruns
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

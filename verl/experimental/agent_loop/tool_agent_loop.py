@@ -36,7 +36,7 @@ from verl.tools.schemas import (
 from verl.tools.utils.tool_registry import initialize_tools_from_config
 from verl.utils.chat_template import initialize_system_prompt
 from verl.utils.profiler import simple_timer
-from verl.utils.rollout_trace import rollout_trace_op
+from verl.utils.rollout_trace import rollout_trace_add_tags, rollout_trace_op
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -248,6 +248,7 @@ class ToolAgentLoop(AgentLoopBase):
 
         # Assign a single reward to root + clones to bypass default reward loop
         reward_value = self._assign_rewards(output, agent_data.clone_rollouts)
+        # rollout_trace_add_tags({"assigned_reward": reward_value})
         output.extra_fields["reward_source"] = "clone_reward_fn"
         outputs = [output, *agent_data.clone_rollouts] if agent_data.clone_rollouts else [output]
         for rollout in outputs:
@@ -645,7 +646,8 @@ class ToolAgentLoop(AgentLoopBase):
                 (
                     "You are a helper clone spawned by a root agent. "
                     "Denote a concise final answer with \"Answer:\". "
-                    "Prefer short, actionable responses and conserve tokens."
+                    "Prefer short, actionable responses and conserve tokens. "
+                    "If you cannot complete the objective, state a brief failure reason."
                 ),
             ),
             "final_answer_markers": final_markers,
@@ -667,11 +669,11 @@ class ToolAgentLoop(AgentLoopBase):
                     properties={
                         "objectives": OpenAIFunctionPropertySchema(
                             type="array",
-                            description="List of objectives or messages for each clone (string or object).",
+                            description="Independent prompt to send to each clone in parallel. Engineer carefully.",
                         ),
                         "shared_context": OpenAIFunctionPropertySchema(
                             type="string",
-                            description="Context to share. Only include if absolutely necessary.",
+                            description="Common context to share. Only include if absolutely necessary.",
                         ),
                         # "allow_tools": OpenAIFunctionPropertySchema(
                         #     type="boolean",
@@ -702,6 +704,44 @@ class ToolAgentLoop(AgentLoopBase):
 
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         return lines[-1] if lines else ""
+
+    def _clone_turn_index(self, agent_data: AgentData) -> int:
+        """Return the zero-based assistant turn index for labeling clones."""
+        return max(agent_data.assistant_turns - 1, 0)
+
+    def _default_clone_label(self, agent_data: AgentData, index: int) -> str:
+        turn_index = self._clone_turn_index(agent_data)
+        return f"turn{turn_index}_clone{index}"
+
+    def _resolve_clone_label(self, agent_data: AgentData, name: Optional[str], index: int) -> str:
+        return name or self._default_clone_label(agent_data, index)
+
+    def _summarize_clone_error(self, error: Exception) -> str:
+        message = str(error).strip()
+        lowered = message.lower()
+        context_markers = [
+            "context length",
+            "maximum context",
+            "max context",
+            "context window",
+            "prompt too long",
+            "too many tokens",
+            "sequence length",
+            "input length",
+            "tokens exceed",
+        ]
+        if any(marker in lowered for marker in context_markers):
+            return "failed due to context limit"
+        if "cancelled" in lowered or "canceled" in lowered:
+            return "failed due to cancellation"
+        if "timeout" in lowered or "timed out" in lowered:
+            return "failed due to timeout"
+        if not message:
+            return "failed due to error"
+        cleaned = " ".join(message.split())
+        if len(cleaned) > 200:
+            cleaned = cleaned[:200].rstrip() + "..."
+        return f"failed due to error: {cleaned}"
 
     @classmethod
     def _load_reward_fn(cls, clone_config: dict[str, Any]):
@@ -802,7 +842,8 @@ class ToolAgentLoop(AgentLoopBase):
         if request.get("shared_context"):
             user_sections.append(f"Shared context from root:\n{request['shared_context']}")
         if not allow_tools:
-            user_sections.append("Do not call any tools; respond directly.")
+            # user_sections.append("Do not call any tools; respond directly.")
+            pass
         else:
             user_sections.append("Use tools only if it shortens the path to the answer.")
 
@@ -811,10 +852,12 @@ class ToolAgentLoop(AgentLoopBase):
             {"role": "user", "content": "\n\n".join([section for section in user_sections if section])},
         ]
 
-    def _normalize_clone_requests(self, tool_args: dict[str, Any]) -> list[dict[str, Any]]:
+    def _normalize_clone_requests(
+        self, tool_args: dict[str, Any]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Normalize user-specified clone objectives into a list of requests."""
         if not isinstance(tool_args, dict):
-            return []
+            return [], []
 
         shared_context = tool_args.get("shared_context") or tool_args.get("context")
         allow_tools = tool_args.get("allow_tools")
@@ -826,27 +869,72 @@ class ToolAgentLoop(AgentLoopBase):
         if raw_requests is None and "objective" in tool_args:
             raw_requests = [tool_args["objective"]]
         if raw_requests is None:
-            return []
+            return [], []
         if isinstance(raw_requests, str):
             raw_requests = [raw_requests]
+        if not isinstance(raw_requests, list):
+            return (
+                [],
+                [
+                    {
+                        "index": 0,
+                        "name": None,
+                        "objective": None,
+                        "reason": "failed due to invalid objectives format",
+                    }
+                ],
+            )
 
         names = tool_args.get("names") if isinstance(tool_args.get("names"), list) else None
         normalized: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
         for idx, item in enumerate(raw_requests):
             if isinstance(item, str):
                 name = names[idx] if names and idx < len(names) else None
+                instruction = item.strip()
+                if not instruction:
+                    rejected.append(
+                        {
+                            "index": idx,
+                            "name": name,
+                            "objective": None,
+                            "reason": "failed due to missing instruction",
+                        }
+                    )
+                    continue
                 normalized.append(
                     {
-                        "instruction": item,
+                        "instruction": instruction,
                         "shared_context": shared_context,
                         "name": name,
                         "allow_tools": allow_tools,
                         "sampling_overrides": sampling_overrides,
+                        "index": idx,
                     }
                 )
             elif isinstance(item, dict):
                 instruction = item.get("instruction") or item.get("objective") or item.get("task")
+                if isinstance(instruction, str):
+                    instruction = instruction.strip()
                 if not instruction:
+                    rejected.append(
+                        {
+                            "index": idx,
+                            "name": item.get("name") or item.get("label"),
+                            "objective": None,
+                            "reason": "failed due to missing instruction",
+                        }
+                    )
+                    continue
+                if not isinstance(instruction, str):
+                    rejected.append(
+                        {
+                            "index": idx,
+                            "name": item.get("name") or item.get("label"),
+                            "objective": None,
+                            "reason": "failed due to invalid instruction type",
+                        }
+                    )
                     continue
                 normalized.append(
                     {
@@ -855,13 +943,23 @@ class ToolAgentLoop(AgentLoopBase):
                         "name": item.get("name") or item.get("label"),
                         "allow_tools": item.get("allow_tools", allow_tools),
                         "sampling_overrides": item.get("sampling_overrides", sampling_overrides),
+                        "index": idx,
+                    }
+                )
+            else:
+                rejected.append(
+                    {
+                        "index": idx,
+                        "name": None,
+                        "objective": None,
+                        "reason": "failed due to invalid objective type",
                     }
                 )
 
         for request in normalized:
             if request.get("allow_tools") is None:
                 request["allow_tools"] = self.clone_config["allow_tool_use"]
-        return normalized
+        return normalized, rejected
 
     async def _run_single_clone(
         self, request: dict[str, Any], agent_data: AgentData, sampling_params: dict[str, Any], index: int
@@ -869,7 +967,7 @@ class ToolAgentLoop(AgentLoopBase):
         """Spin up a clone ToolAgentLoop using the same weights and context."""
         clone_id = uuid4().hex
         clone_depth = agent_data.extra_fields.get("clone_depth", 0) + 1
-        clone_label = request.get("name") or f"clone_{index}"
+        clone_label = self._resolve_clone_label(agent_data, request.get("name"), index)
 
         clone_sampling = dict(sampling_params)
         if request.get("sampling_overrides"):
@@ -937,8 +1035,8 @@ class ToolAgentLoop(AgentLoopBase):
                 {},
             )
 
-        requests = self._normalize_clone_requests(tool_args)
-        if not requests:
+        requests, rejected = self._normalize_clone_requests(tool_args)
+        if not requests and not rejected:
             return ToolResponse(text="No clone objectives provided."), None, {}
 
         clone_tool_overrides = agent_data.tools_kwargs.get(self.clone_tool_name, {})
@@ -954,19 +1052,40 @@ class ToolAgentLoop(AgentLoopBase):
                 len(requests),
                 max_clones,
             )
+            dropped = requests[max_clones:]
             requests = requests[:max_clones]
+            for request in dropped:
+                rejected.append(
+                    {
+                        "index": request.get("index", 0),
+                        "name": request.get("name"),
+                        "objective": request.get("instruction"),
+                        "reason": "failed due to clone limit",
+                    }
+                )
 
         tasks = [
-            self._run_single_clone(request, agent_data, sampling_params, index=i) for i, request in enumerate(requests)
+            self._run_single_clone(request, agent_data, sampling_params, index=request.get("index", 0))
+            for request in requests
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         clone_rollouts: list[AgentLoopOutput] = []
         clone_summaries: list[dict[str, Any]] = []
-        errors: list[str] = []
-        for result in results:
+        entries: list[dict[str, Any]] = []
+        for request, result in zip(requests, results):
+            label = self._resolve_clone_label(agent_data, request.get("name"), request.get("index", 0))
+            objective = request.get("instruction")
             if isinstance(result, Exception):
-                errors.append(str(result))
+                entries.append(
+                    {
+                        "index": request.get("index", 0),
+                        "label": label,
+                        "text": self._summarize_clone_error(result),
+                        "objective": objective,
+                        "status": "failed",
+                    }
+                )
                 continue
             clone_rollouts.extend(result.rollouts)
             clone_summaries.append(
@@ -977,10 +1096,35 @@ class ToolAgentLoop(AgentLoopBase):
                     "answer": result.visible_text,
                 }
             )
+            entries.append(
+                {
+                    "index": request.get("index", 0),
+                    "label": result.label,
+                    "text": result.visible_text,
+                    "objective": result.objective,
+                    "status": "ok",
+                }
+            )
 
-        lines = [f"{summary['label']}: {summary['answer']}" for summary in clone_summaries]
-        if errors:
-            lines.append(f"Errors while running some clones: {errors}")
+        for request in rejected:
+            entries.append(
+                {
+                    "index": request.get("index", 0),
+                    "label": self._resolve_clone_label(agent_data, request.get("name"), request.get("index", 0)),
+                    "text": request.get("reason", "failed due to invalid objective"),
+                    "objective": request.get("objective"),
+                    "status": "failed",
+                }
+            )
+
+        lines = []
+        if entries:
+            for entry in sorted(entries, key=lambda item: item.get("index", 0)):
+                text = entry["text"]
+                if entry.get("status") == "failed" and entry.get("objective"):
+                    text = f"{text} (objective: {entry['objective']})"
+                lines.append(f"{entry['label']}: {text}")
+
         tool_response_text = "\n".join(lines) if lines else "No clone returned a response."
 
         extra = {
